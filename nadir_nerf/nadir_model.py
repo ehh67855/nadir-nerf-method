@@ -19,10 +19,10 @@ class NadirModelConfig(DepthNerfactoModelConfig):
     _target: Type = field(default_factory=lambda: NadirModel)
     height_grid_resolution: int = 256
     """Resolution for potential grid-based priors (placeholder)."""
-    sheet_sigma: float = 0.5
-    """Standard deviation of the Gaussian sheet prior."""
-    sheet_amplitude: float = 1.0
-    """Amplitude of the Gaussian sheet density contribution."""
+    sheet_sigma: float = 0.30
+    """Gaussian sheet thickness in meters (kept relatively wide)."""
+    sheet_amplitude: float = 0.5
+    """Small additive strength to avoid overpowering the base density."""
     height_residual_scale: float = 1.0
     """Scale applied to residual height predictions."""
 
@@ -67,11 +67,11 @@ class NadirModel(DepthNerfactoModel):
             return torch.zeros_like(positions[..., :1])
         height = self.query_height(positions)
         z = positions[..., 2:3]
-        signed_distance = z - height
-        sigma = max(float(self.config.sheet_sigma), 1e-6)
-        amplitude = float(self.config.sheet_amplitude)
-        s_normalized = signed_distance / sigma
-        return amplitude * torch.exp(-0.5 * (s_normalized**2))
+        s = z - height
+        sigma = self.config.sheet_sigma
+        amplitude = self.config.sheet_amplitude
+        sheet_density = amplitude * torch.exp(-0.5 * (s / sigma) ** 2)
+        return sheet_density
 
     def _wrap_field_density(self) -> None:
         """Wrap the field density call with a Gaussian sheet additive prior."""
