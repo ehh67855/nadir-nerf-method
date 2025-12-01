@@ -47,6 +47,8 @@ class NadirModelConfig(DepthNerfactoModelConfig):
     """Clamp proposal gating in XY; kept false by default to reduce edge pinching."""
     proposal_gate_clamp_inside: bool = False
     """Apply inside-AABB mask during proposal gating; kept false to avoid double clamping."""
+    export_ground_filter: bool = False
+    """If False, export-time ground filtering uses only the global floor (no learned height mask)."""
 
 
 class NadirModel(DepthNerfactoModel):
@@ -113,6 +115,9 @@ class NadirModel(DepthNerfactoModel):
 
     def query_height_from_xy(self, xy: torch.Tensor) -> torch.Tensor:
         """Expose a convenient XY-only height query for downstream export filters."""
+        if not self.config.export_ground_filter:
+            floor = xy.new_tensor(self.hard_floor_z)
+            return floor.expand_as(xy[..., :1])
         zeros = torch.zeros_like(xy[..., :1])
         positions = torch.cat([xy, zeros], dim=-1)
         return self.query_height(positions)
