@@ -29,7 +29,7 @@ nadir_nerf = MethodSpecification(
             datamanager=NadirDataManagerConfig(
                 dataparser=NerfstudioDataParserConfig(),
                 train_num_rays_per_batch=4096,
-                eval_num_rays_per_batch=4096, #add command line arguments here
+                eval_num_rays_per_batch=4096,
             ),
             model=NadirModelConfig(
                 eval_num_rays_per_chunk=1 << 15,
