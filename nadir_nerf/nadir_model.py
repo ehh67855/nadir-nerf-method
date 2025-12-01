@@ -35,6 +35,8 @@ class NadirModelConfig(DepthNerfactoModelConfig):
     """Extra margin above scene-box min Z; density is zeroed below max(ground, scene_min_z + margin)."""
     ground_clamp_to_scene_box: bool = True
     """Zero density outside the scene-box XY to prevent spill-over at the edges."""
+    hard_floor_z: float | None = None
+    """Optional absolute floor z (world units). If set, density is zeroed below this regardless of the learned ground."""
 
 
 class NadirModel(DepthNerfactoModel):
@@ -45,6 +47,13 @@ class NadirModel(DepthNerfactoModel):
     def populate_modules(self):
         """Initialize base modules then register the height residual network and gating."""
         super().populate_modules()
+        # Absolute floor derived from config or scene box; used to forbid density below this plane.
+        scene_floor = float(self.scene_box.aabb[0, 2].item())
+        self.hard_floor_z = (
+            float(self.config.hard_floor_z)
+            if self.config.hard_floor_z is not None
+            else scene_floor + float(self.config.ground_floor_margin)
+        )
         self.height_residual_mlp = MLP(
             in_dim=2,
             out_dim=1,
@@ -72,6 +81,12 @@ class NadirModel(DepthNerfactoModel):
         delta_h = self.height_residual_mlp(xy)
         return h0 + self.config.height_residual_scale * delta_h
 
+    def query_height_from_xy(self, xy: torch.Tensor) -> torch.Tensor:
+        """Expose a convenient XY-only height query for downstream export filters."""
+        zeros = torch.zeros_like(xy[..., :1])
+        positions = torch.cat([xy, zeros], dim=-1)
+        return self.query_height(positions)
+
     def _height_gate(self, positions: torch.Tensor) -> torch.Tensor:
         """Gate that suppresses density below the learned ground height and outside the scene box."""
         aabb = self.scene_box.aabb.to(device=positions.device, dtype=positions.dtype)
@@ -95,14 +110,20 @@ class NadirModel(DepthNerfactoModel):
 
     def _apply_height_gate(self, positions: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
         gate = self._height_gate(positions)
-        return density * gate
+        aabb = self.scene_box.aabb.to(device=positions.device, dtype=positions.dtype)
+        inside = ((positions >= aabb[0]) & (positions <= aabb[1])).all(dim=-1, keepdim=True).to(positions.dtype)
+
+        gated = density * gate * inside
+        gated = torch.where(inside > 0.5, gated, torch.zeros_like(gated))
+        return gated
 
     def _make_height_gated_density_fn(self, density_fn: Callable) -> Callable:
         """Gate proposal network density functions to avoid sampling far below ground."""
 
         def gated_fn(positions: torch.Tensor, *args, **kwargs):
-            density = density_fn(positions, *args, **kwargs)
-            return self._apply_height_gate(positions, density)
+            base = density_fn(positions, *args, **kwargs)
+            gated = self._apply_height_gate(positions, base)
+            return torch.nn.functional.relu(gated)
 
         return gated_fn
 
@@ -110,6 +131,11 @@ class NadirModel(DepthNerfactoModel):
         """Same as depth-nerfacto but gate densities using the learned ground height."""
         if self.training:
             self.camera_optimizer.apply_to_raybundle(ray_bundle)
+        if ray_bundle.fars is not None:
+            ray_bundle.fars = torch.minimum(
+                ray_bundle.fars,
+                torch.full_like(ray_bundle.fars, self.config.far_plane)
+            )
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
         field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
         if self.config.use_gradient_scaling:
@@ -159,6 +185,17 @@ class NadirModel(DepthNerfactoModel):
         for i in range(self.config.num_proposal_iterations):
             outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
         return outputs
+
+    def get_rgba_image(self, outputs, output_name: str = "rgb"):
+        """Use accumulation as the alpha channel so point-cloud export masks low-opacity rays."""
+        accumulation_name = output_name.replace("rgb", "accumulation")
+        if accumulation_name not in outputs:
+            raise NotImplementedError(f"get_rgba_image is not implemented for model {self.__class__.__name__}")
+        rgb = outputs[output_name]
+        acc = outputs[accumulation_name]
+        if acc.dim() < rgb.dim():
+            acc = acc.unsqueeze(-1)
+        return torch.cat((rgb, acc), dim=-1)
 
     # Depth supervision is optional. Fall back to vanilla Nerfacto metrics/losses
     # when the batch does not carry depth annotations.
