@@ -33,7 +33,6 @@ nadir_nerf = MethodSpecification(
             ),
             model=NadirModelConfig(
                 eval_num_rays_per_chunk=1 << 15,
-                average_init_density=0.01,
             ),
         ),
         optimizers={

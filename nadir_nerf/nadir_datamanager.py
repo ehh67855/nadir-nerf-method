@@ -8,6 +8,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManager,
     VanillaDataManagerConfig,
 )
+from nerfstudio.data.datasets.depth_dataset import DepthDataset
 
 
 @dataclass
@@ -18,7 +19,7 @@ class NadirDataManagerConfig(VanillaDataManagerConfig):
     _target: Type = field(default_factory=lambda: NadirDataManager)
 
 
-class NadirDataManager(VanillaDataManager):
+class NadirDataManager(VanillaDataManager[DepthDataset]):
 
     config: NadirDataManagerConfig
 
