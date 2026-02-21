@@ -4,6 +4,25 @@ version = "0.1.0"
 
 dependencies = ["nerfstudio >= 0.3.0"] 
 
+[project.optional-dependencies]
+uav-pipeline = [
+    "numpy",
+    "opencv-python",
+    "Pillow",
+    "scikit-image",
+    "imageio",
+    "pyexiftool",
+    "pysolar",
+    "pyzbar",
+    "matplotlib",
+    "requests",
+    "packaging",
+    "pytz",
+]
+
+[project.scripts]
+nadir-nerf-pipeline = "nadir_nerf.uav_pipeline:main"
+
 [tool.setuptools.packages.find]
 include = ["nadir_nerf*"]
 

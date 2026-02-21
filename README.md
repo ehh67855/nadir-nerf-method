@@ -1,34 +1,87 @@
-# nerfstudio-method-template
-Template repository for creating and registering methods in Nerfstudio.
+# Nadir-NeRF Method + UAV Processing Pipeline
 
-## File Structure
-We recommend the following file structure:
+This repository provides:
 
-```
-├── my_method
-│   ├── __init__.py
-│   ├── my_config.py
-│   ├── custom_pipeline.py [optional]
-│   ├── custom_model.py [optional]
-│   ├── custom_field.py [optional]
-│   ├── custom_datamanger.py [optional]
-│   ├── custom_dataparser.py [optional]
-│   ├── ...
-├── pyproject.toml
-```
+1. A Nerfstudio method plugin named `nadir-nerf`.
+2. A CLI pipeline that automates your MicaSense -> COLMAP(ECEF) -> Nerfstudio workflow.
 
-## Registering with Nerfstudio
-Ensure that nerfstudio has been installed according to the [instructions](https://docs.nerf.studio/en/latest/quickstart/installation.html). Clone or fork this repository and run the commands:
+## Install
 
-```
-conda activate nerfstudio
-cd nerfstudio-method-template/
-pip install -e .
+```bash
+cd nadir-nerf-method
+pip install -e ".[uav-pipeline]"
 ns-install-cli
 ```
 
-## Running the new method
-This repository creates a new Nerfstudio method named "method-template". To train with it, run the command:
+If your `micasense` package is not pip-installed but exists in source form (for example `../imageprocessing/micasense`), the pipeline will auto-detect it.
+
+## Train Nadir-NeRF (existing ns-data)
+
+```bash
+ns-train nadir-nerf --data /path/to/ns-data
 ```
-ns-train method-template --data [PATH]
+
+## End-to-End UAV Pipeline
+
+The new command is:
+
+```bash
+nadir-nerf-pipeline run --workspace-dir /path/to/workspace --raw-image-dir /path/to/raw
+```
+
+By default, this performs:
+
+1. MicaSense alignment + radiometric output to `workspace/images`
+2. `metadata.txt` generation for COLMAP model alignment
+3. COLMAP feature extraction, matching, mapping
+4. `colmap model_aligner` to ECEF
+5. `ns-process-data images --skip-colmap --colmap-model-path colmap/sparse/ecef --use-sfm-depth`
+
+This default path runs fully inside your current active environment.
+
+### Optional train + export in one run
+
+```bash
+nadir-nerf-pipeline run \
+  --workspace-dir /path/to/workspace \
+  --raw-image-dir /path/to/raw \
+  --run-train \
+  --run-export
+```
+
+Pointcloud export defaults:
+- `--export-num-points 1000000`
+- `--export-remove-outliers true`
+- `--export-normal-method open3d`
+- `--export-save-world-frame true` (keeps ECEF/world frame)
+
+## Local MicaSense Source (Optional)
+
+If needed, you can point to your source checkout explicitly:
+
+```bash
+nadir-nerf-pipeline run \
+  --workspace-dir /path/to/workspace \
+  --raw-image-dir /path/to/raw \
+  --micasense-package-dir /home/myid/ehh67855/thesis/imageprocessing
+```
+
+The same flag is available on `nadir-nerf-pipeline preprocess`.
+
+## Useful Stage Controls
+
+- Skip preprocessing: `--skip-preprocess` (requires existing processed images and metadata)
+- Skip COLMAP: `--skip-colmap --aligned-model-path /path/to/ecef`
+- Skip `ns-process-data`: `--skip-ns-process-data`
+- Switch model staging mode: `--colmap-transfer copy|symlink`
+- Set alignment tolerance: `--alignment-max-error 10.0`
+- Advanced only: use `--preprocess-prefix`, `--colmap-prefix`, `--nerfstudio-prefix` if you still want multi-env execution
+
+## Standalone Preprocess Command
+
+```bash
+nadir-nerf-pipeline preprocess \
+  --raw-image-dir /path/to/raw \
+  --output-image-dir /path/to/images \
+  --metadata-path /path/to/metadata.txt
 ```

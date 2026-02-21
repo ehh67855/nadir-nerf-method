@@ -274,6 +274,15 @@ class NadirModel(DepthNerfactoModel):
         below_ground_distance = torch.relu(ground - positions[..., 2:3])
         return (weights * below_ground_distance).sum(dim=-2).mean()
 
+    def _eval_ground_visibility_mask(self, ray_bundle, depth: torch.Tensor) -> torch.Tensor:
+        """Visibility mask used for eval/export to reject rendered points below floor."""
+        rendered_points = ray_bundle.origins + ray_bundle.directions * depth
+        if self.config.export_ground_filter:
+            floor = self._predict_ground_height(rendered_points)
+        else:
+            floor = self._get_base_floor(rendered_points)
+        return (rendered_points[..., 2:3] >= floor).to(depth.dtype)
+
     def get_outputs(self, ray_bundle):
         """Same as depth-nerfacto but gate densities with the learned ground surface."""
         if self.training:
@@ -301,6 +310,8 @@ class NadirModel(DepthNerfactoModel):
             depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
         expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
         accumulation = self.renderer_accumulation(weights=weights)
+        if not self.training:
+            accumulation = accumulation * self._eval_ground_visibility_mask(ray_bundle, depth)
 
         outputs = {
             "rgb": rgb,
@@ -334,6 +345,17 @@ class NadirModel(DepthNerfactoModel):
         for i in range(self.config.num_proposal_iterations):
             outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
         return outputs
+
+    def get_rgba_image(self, outputs: Dict[str, torch.Tensor], output_name: str = "rgb") -> torch.Tensor:
+        """Return RGBA with true volumetric alpha for point-cloud export filtering."""
+        accumulation_name = output_name.replace("rgb", "accumulation")
+        if accumulation_name not in outputs:
+            return super().get_rgba_image(outputs, output_name)
+        rgb = outputs[output_name]
+        acc = outputs[accumulation_name]
+        if acc.dim() < rgb.dim():
+            acc = acc.unsqueeze(-1)
+        return torch.cat((rgb, acc.clamp(0.0, 1.0)), dim=-1)
 
     def get_metrics_dict(self, outputs, batch):
         metrics_dict = super().get_metrics_dict(outputs, batch)
