@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Type
+from typing import Dict, List, Type
 
 import torch
 import torch.nn.functional as F
@@ -30,32 +30,14 @@ class NadirModelConfig(DepthNerfactoModelConfig):
     """Steepness factor for the smooth gate; higher is closer to a binary mask."""
     strict_eval_ground_clamp: bool = True
     """Apply a hard below-ground clamp at eval/export even when training uses a soft gate."""
-    ground_floor_margin: float = 0.0
-    """Extra margin above scene-box min Z; density is zeroed below max(ground, scene_min_z + margin)."""
     ground_quantile: float = 0.1
     """Target quantile for depth-supervised ground fitting (smaller -> lower envelope)."""
     ground_loss_mult: float = 0.05
     """Weight for depth-driven quantile loss on the learned ground surface."""
     ground_smoothness_loss_mult: float = 1e-4
     """Weight for TV smoothness regularization on the ground surface."""
-    ground_below_weight_loss_mult: float = 0.05
+    ground_below_weight_loss_mult: float = 0.1
     """Weight for suppressing rendered mass below the learned ground."""
-    ground_clamp_to_scene_box: bool = True
-    """Zero density outside the scene-box XY to prevent spill-over at the edges."""
-    hard_floor_z: float | None = None
-    """Optional absolute floor z (world units). If set, density is zeroed below this regardless of the learned ground."""
-    gate_proposals: bool = False
-    """Whether to height-gate proposal networks (disable to match depth-nerfacto sampling)."""
-    proposal_gate_softness: float | None = None
-    """Optional softness override for proposal gating; defaults to ground_gate_softness."""
-    proposal_gate_steepness: float | None = None
-    """Optional steepness override for proposal gating; defaults to ground_gate_steepness."""
-    proposal_gate_clamp_xy: bool = False
-    """Clamp proposal gating in XY; kept false by default to reduce edge pinching."""
-    proposal_gate_clamp_inside: bool = False
-    """Apply inside-AABB mask during proposal gating; kept false to avoid double clamping."""
-    export_ground_filter: bool = False
-    """If False, export-time ground filtering uses only the global floor (no learned height mask)."""
 
 
 class NadirModel(DepthNerfactoModel):
@@ -67,42 +49,13 @@ class NadirModel(DepthNerfactoModel):
         """Initialize base modules and register learned ground-surface components."""
         super().populate_modules()
 
-        # Absolute floor derived from config or scene box; density is forbidden below this.
         scene_floor = float(self.scene_box.aabb[0, 2].item())
         scene_ceiling = float(self.scene_box.aabb[1, 2].item())
         scene_z_span = max(scene_ceiling - scene_floor, 1e-3)
-        self.hard_floor_z = (
-            float(self.config.hard_floor_z)
-            if self.config.hard_floor_z is not None
-            else scene_floor + float(self.config.ground_floor_margin)
-        )
 
         grid_resolution = max(2, int(self.config.height_grid_resolution))
         self.ground_height_grid = Parameter(torch.full((1, 1, grid_resolution, grid_resolution), -6.0))
         self.ground_height_span = float(max(self.config.height_residual_scale, 1e-4)) * scene_z_span
-
-        # Gate proposal networks so sampling avoids regions far below the learned ground.
-        if self.config.gate_proposals:
-            prop_softness = (
-                self.config.proposal_gate_softness
-                if self.config.proposal_gate_softness is not None
-                else self.config.ground_gate_softness
-            )
-            prop_steepness = (
-                self.config.proposal_gate_steepness
-                if self.config.proposal_gate_steepness is not None
-                else self.config.ground_gate_steepness
-            )
-            self.density_fns = [
-                self._make_height_gated_density_fn(
-                    fn,
-                    clamp_inside=self.config.proposal_gate_clamp_inside,
-                    clamp_xy=self.config.proposal_gate_clamp_xy,
-                    softness=prop_softness,
-                    steepness=prop_steepness,
-                )
-                for fn in self.density_fns
-            ]
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = super().get_param_groups()
@@ -114,9 +67,7 @@ class NadirModel(DepthNerfactoModel):
 
     def _get_base_floor(self, positions: torch.Tensor) -> torch.Tensor:
         aabb = self.scene_box.aabb.to(device=positions.device, dtype=positions.dtype)
-        floor_from_scene = aabb[0, 2:3] + self.config.ground_floor_margin
-        floor_from_hard = positions.new_tensor(self.hard_floor_z).reshape(1)
-        return torch.maximum(floor_from_scene, floor_from_hard)
+        return aabb[0, 2:3]
 
     def _predict_ground_height(self, positions: torch.Tensor) -> torch.Tensor:
         """Predict per-sample ground Z from XY by bilinear lookup in a learned grid."""
@@ -142,24 +93,17 @@ class NadirModel(DepthNerfactoModel):
         residual_logits = residual_logits.reshape(-1).reshape(*positions.shape[:-1], 1)
         residual_height = torch.sigmoid(residual_logits) * positions.new_tensor(self.ground_height_span)
 
-        learned_floor = base_floor + residual_height
-        ceiling = aabb[1, 2:3]
-        return torch.minimum(learned_floor, ceiling)
+        return base_floor + residual_height
 
     def _height_gate(
         self,
         positions: torch.Tensor,
-        *,
-        clamp_xy: bool = True,
-        softness: float | None = None,
-        steepness: float | None = None,
     ) -> torch.Tensor:
         """Gate that suppresses density below the learned ground surface."""
-        aabb = self.scene_box.aabb.to(device=positions.device, dtype=positions.dtype)
         floor = self._predict_ground_height(positions)
         delta = positions[..., 2:3] - floor
-        gate_softness = self.config.ground_gate_softness if softness is None else softness
-        gate_steepness = self.config.ground_gate_steepness if steepness is None else steepness
+        gate_softness = self.config.ground_gate_softness
+        gate_steepness = self.config.ground_gate_steepness
         if gate_softness <= 0:
             gate_z = (delta >= 0).to(positions.dtype)
         else:
@@ -168,62 +112,14 @@ class NadirModel(DepthNerfactoModel):
             gate_z = torch.sigmoid(steepness_t * delta / softness_t)
         if not self.training and self.config.strict_eval_ground_clamp:
             gate_z = gate_z * (delta >= 0).to(positions.dtype)
-
-        if clamp_xy and self.config.ground_clamp_to_scene_box:
-            inside_xy = (positions[..., :2] >= aabb[0, :2]) & (positions[..., :2] <= aabb[1, :2])
-            gate_xy = inside_xy.all(dim=-1, keepdim=True).to(positions.dtype)
-        else:
-            gate_xy = 1.0
-
-        return gate_z * gate_xy
+        return gate_z
 
     def _apply_height_gate(
         self,
         positions: torch.Tensor,
         density: torch.Tensor,
-        *,
-        clamp_inside: bool = False,
-        clamp_xy: bool = False,
-        softness: float | None = None,
-        steepness: float | None = None,
     ) -> torch.Tensor:
-        gate = self._height_gate(
-            positions,
-            clamp_xy=clamp_xy,
-            softness=softness,
-            steepness=steepness,
-        )
-        if clamp_inside:
-            aabb = self.scene_box.aabb.to(device=positions.device, dtype=positions.dtype)
-            inside = ((positions >= aabb[0]) & (positions <= aabb[1])).all(dim=-1, keepdim=True).to(positions.dtype)
-            return density * gate * inside
-
-        return density * gate
-
-    def _make_height_gated_density_fn(
-        self,
-        density_fn: Callable,
-        *,
-        clamp_inside: bool = True,
-        clamp_xy: bool = True,
-        softness: float | None = None,
-        steepness: float | None = None,
-    ) -> Callable:
-        """Gate proposal network density functions to avoid sampling far below ground."""
-
-        def gated_fn(positions: torch.Tensor, *args, **kwargs):
-            base = density_fn(positions, *args, **kwargs)
-            gated = self._apply_height_gate(
-                positions,
-                base,
-                clamp_inside=clamp_inside,
-                clamp_xy=clamp_xy,
-                softness=softness,
-                steepness=steepness,
-            )
-            return F.relu(gated)
-
-        return gated_fn
+        return density * self._height_gate(positions)
 
     def _ground_quantile_depth_loss(self, outputs: Dict, batch: Dict) -> torch.Tensor:
         if not self.config.learn_ground_surface:
@@ -277,10 +173,7 @@ class NadirModel(DepthNerfactoModel):
     def _eval_ground_visibility_mask(self, ray_bundle, depth: torch.Tensor) -> torch.Tensor:
         """Visibility mask used for eval/export to reject rendered points below floor."""
         rendered_points = ray_bundle.origins + ray_bundle.directions * depth
-        if self.config.export_ground_filter:
-            floor = self._predict_ground_height(rendered_points)
-        else:
-            floor = self._get_base_floor(rendered_points)
+        floor = self._get_base_floor(rendered_points)
         return (rendered_points[..., 2:3] >= floor).to(depth.dtype)
 
     def get_outputs(self, ray_bundle):
@@ -293,12 +186,7 @@ class NadirModel(DepthNerfactoModel):
             field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
 
         positions = ray_samples.frustums.get_positions()
-        gated_density = self._apply_height_gate(
-            positions,
-            field_outputs[FieldHeadNames.DENSITY],
-            clamp_inside=False,
-            clamp_xy=False,
-        )
+        gated_density = self._apply_height_gate(positions, field_outputs[FieldHeadNames.DENSITY])
         field_outputs[FieldHeadNames.DENSITY] = gated_density
 
         weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
